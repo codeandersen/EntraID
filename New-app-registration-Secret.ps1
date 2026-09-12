@@ -21,40 +21,13 @@ param(
 )
 
 function Initialize-Graph {
-  # Applications requires a matching Authentication build (RequiredModules).
-  # Mixed Graph versions across PSModulePath cause: "required module ... is not loaded".
-  $authName = 'Microsoft.Graph.Authentication'
-  $appName  = 'Microsoft.Graph.Applications'
-
-  foreach ($m in @($authName, $appName)) {
+  $modules = @('Microsoft.Graph.Authentication','Microsoft.Graph.Applications')
+  foreach ($m in $modules) {
     if (-not (Get-Module -ListAvailable -Name $m)) {
-      Install-Module $m -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+      Install-Module $m -Scope CurrentUser -Force -ErrorAction Stop
     }
+    Import-Module $m -Force -ErrorAction Stop
   }
-
-  $appMod = Get-Module -ListAvailable -Name $appName |
-    Sort-Object Version -Descending |
-    Select-Object -First 1
-
-  $authMatch = Get-Module -ListAvailable -Name $authName |
-    Where-Object { $_.Version -eq $appMod.Version } |
-    Select-Object -First 1
-
-  if (-not $authMatch) {
-    Write-Host "Installing $authName $($appMod.Version) to match $appName..." -ForegroundColor Yellow
-    Install-Module $authName -RequiredVersion $appMod.Version -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-    $authMatch = Get-Module -ListAvailable -Name $authName |
-      Where-Object { $_.Version -eq $appMod.Version } |
-      Select-Object -First 1
-  }
-
-  if (-not $authMatch) {
-    throw "Could not load matching $authName for $appName $($appMod.Version). Align Microsoft.Graph.* module versions (Install-Module Microsoft.Graph -Scope CurrentUser -Force)."
-  }
-
-  Remove-Module Microsoft.Graph.* -Force -ErrorAction SilentlyContinue
-  Import-Module $authMatch.Path -Force -ErrorAction Stop
-  Import-Module $appMod.Path -Force -ErrorAction Stop
 
   try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch { }
 
@@ -66,7 +39,6 @@ function Initialize-Graph {
   }
 }
 
-
 function New-DisplayName {
   param([string]$Prefix,[string]$Service,[string]$Workload,[string]$BusinessUnit,[string]$Environment,[string]$Function)
   $name = ("{0}-{1}-{2}-{3}-{4}-{5}" -f $Prefix,$Service,$Workload,$BusinessUnit,$Environment,$Function).ToLower()
@@ -75,10 +47,18 @@ function New-DisplayName {
   return $name
 }
 
+function New-SecretName {
+  param([string]$Service,[string]$Workload,[string]$BusinessUnit,[string]$Environment)
+  $s = ("{0}-{1}-{2}-{3}" -f $Service,$Workload,$BusinessUnit,$Environment).ToLower()
+  if ($s.Length -gt 64) { $s = $s.Substring(0,64) }
+  return $s
+}
+
 # --- Main ---
 Initialize-Graph
 
 $displayName = New-DisplayName -Prefix $Prefix -Service $Service -Workload $Workload -BusinessUnit $BusinessUnit -Environment $Environment -Function $Function
+$secretName  = New-SecretName  -Service $Service -Workload $Workload -BusinessUnit $BusinessUnit -Environment $Environment
 
 # Guard against duplicates
 $existing = Get-MgApplication -Filter "displayName eq '$displayName'" -ErrorAction SilentlyContinue
@@ -99,11 +79,22 @@ Write-Host "Service principal created. ObjectId: $($sp.Id)" -ForegroundColor Gre
 $spCheck = Get-MgServicePrincipal -ServicePrincipalId $sp.Id
 Write-Host "Tags on SP: $($spCheck.Tags -join ', ')" -ForegroundColor Cyan
 
-# 3) Output to CSV
+# 3) Create Client Secret
+$endIso = (Get-Date).ToUniversalTime().AddMonths($SecretExpiryInMonths).ToString("o")
+$AppPassword = Add-MgApplicationPassword -ApplicationId $app.Id -PasswordCredential @{
+  displayName = $secretName
+  endDateTime = $endIso
+} -ErrorAction Stop
+
+$secretValue = $AppPassword.SecretText
+if (-not $secretValue) { throw "Client secret created, but no SecretText returned." }
+
+# 4) Output to CSV
 $row = [PSCustomObject]@{
   DisplayName        = $displayName
   ApplicationId      = $app.AppId
   ServicePrincipalId = $sp.Id
+  ClientSecret       = $secretValue
 }
 
 if (Test-Path $OutCsv) {
